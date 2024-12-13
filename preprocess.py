@@ -183,6 +183,7 @@ class Preprocess(nn.Module):
 
     def get_data(self, frames_path, n_frames):
         # load frames
+        # import ipdb; ipdb.set_trace()
         paths =  [f"{frames_path}/%05d.png" % i for i in range(n_frames)]
         if not os.path.exists(paths[0]):
             paths = [f"{frames_path}/%05d.jpg" % i for i in range(n_frames)]
@@ -349,6 +350,6 @@ if __name__ == "__main__":
     parser.add_argument('--inversion_prompt', type=str, default='a woman running')
     opt = parser.parse_args()
     video_path = opt.data_path
-    save_video_frames(video_path, img_size=(opt.W, opt.H))
-    opt.data_path = os.path.join('data', Path(video_path).stem)
+    # save_video_frames(video_path, img_size=(opt.W, opt.H))
+    # opt.data_path = os.path.join('data', Path(video_path).stem)
     prep(opt)

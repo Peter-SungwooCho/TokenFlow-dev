@@ -314,11 +314,11 @@ def make_tokenflow_attention_block(block_class: Type[torch.nn.Module]) -> Type[t
             hidden_states = hidden_states.view(3, n_frames, sequence_length, dim)
 
             if self.use_ada_layer_norm:
-                norm_hidden_states = self.norm1(hidden_states, timestep)
+                norm_hidden_states = self.norm1(hidden_states, timestep) # type: ignore
             elif self.use_ada_layer_norm_zero:
                 norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
                     hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
-                )
+                ) # type: ignore
             else:
                 norm_hidden_states = self.norm1(hidden_states)
 
@@ -332,8 +332,8 @@ def make_tokenflow_attention_block(block_class: Type[torch.nn.Module]) -> Type[t
                 if self.batch_idx > 0:
                     batch_idxs.append(self.batch_idx - 1)
                 
-                sim = batch_cosine_sim(norm_hidden_states[0].reshape(-1, dim),
-                                        self.pivot_hidden_states[0][batch_idxs].reshape(-1, dim))
+                sim = batch_cosine_sim(norm_hidden_states[0].reshape(-1, dim), 
+                                        self.pivot_hidden_states[0][batch_idxs].reshape(-1, dim)) # NN search
                 if len(batch_idxs) == 2:
                     sim1, sim2 = sim.chunk(2, dim=1)
                     # sim: n_frames * seq_len, len(batch_idxs) * seq_len

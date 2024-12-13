@@ -5,6 +5,7 @@ import cv2
 from pathlib import Path
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as T
 import argparse
 from PIL import Image
@@ -66,6 +67,7 @@ class TokenFlow(nn.Module):
         self.text_embeds = self.get_text_embeds(config["prompt"], config["negative_prompt"])
         pnp_inversion_prompt = self.get_pnp_inversion_prompt()
         self.pnp_guidance_embeds = self.get_text_embeds(pnp_inversion_prompt, pnp_inversion_prompt).chunk(2)[0]
+        self.previous_latents = None
     
     @torch.no_grad()   
     def prepare_depth_maps(self, model_type='DPT_Large', device='cuda'):
@@ -154,10 +156,15 @@ class TokenFlow(nn.Module):
 
     @torch.no_grad()
     def decode_latents(self, latents, batch_size=VAE_BATCH_SIZE):
+        # import ipdb; ipdb.set_trace()
         latents = 1 / 0.18215 * latents
         imgs = []
         for i in range(0, len(latents), batch_size):
-            imgs.append(self.vae.decode(latents[i:i + batch_size]).sample)
+            if latents.dtype == torch.float16:
+                imgs.append(self.vae.decode(latents[i:i + batch_size]).sample)
+            else:
+                latents_float16 = latents[i:i + batch_size].to(torch.float16)
+                imgs.append(self.vae.decode(latents_float16).sample)
         imgs = torch.cat(imgs)
         imgs = (imgs / 2 + 0.5).clamp(0, 1)
         return imgs
@@ -217,18 +224,130 @@ class TokenFlow(nn.Module):
         denoised_latent = self.scheduler.step(noise_pred, t, x)['prev_sample']
         return denoised_latent
     
+    @torch.no_grad()
+    def denoise_step_w_deflicker(self, x, t, indices):
+        # register the time step and features in pnp injection modules
+        source_latents = load_source_latents_t(t, self.latents_path)[indices]
+        latent_model_input = torch.cat([source_latents] + ([x] * 2))
+        if self.sd_version == 'depth':
+            latent_model_input = torch.cat([latent_model_input, torch.cat([self.depth_maps[indices]] * 3)], dim=1)
+
+        register_time(self, t.item())
+
+        # compute text embeddings
+        text_embed_input = torch.cat([self.pnp_guidance_embeds.repeat(len(indices), 1, 1),
+                                      torch.repeat_interleave(self.text_embeds, len(indices), dim=0)])
+
+        # apply the denoising network
+        noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embed_input)['sample']
+
+        # perform guidance
+        _, noise_pred_uncond, noise_pred_cond = noise_pred.chunk(3)
+        noise_pred = noise_pred_uncond + self.config["guidance_scale"] * (noise_pred_cond - noise_pred_uncond)
+
+        # compute the denoising step with the reference model
+        denoised_latent = self.scheduler.step(noise_pred, t, x)['prev_sample']
+
+        # DiffSynth Deflickering 적용
+        if self.previous_latents is not None:
+            denoised_latent = self.apply_diff_synth_deflicker(denoised_latent, self.previous_latents)
+
+        # 이전 Latents 업데이트
+        self.previous_latents = denoised_latent.detach()
+
+        return denoised_latent
+
+    @torch.autocast(dtype=torch.float16, device_type='cuda')    
+    def apply_diff_synth_deflicker(self, current_latents, previous_latents):
+        # compute cosine similarity between current and previous latents
+        similarity = self.compute_cosine_sim(current_latents, previous_latents)  # torch.Size([8])
+
+        # choose the most similar latent
+        idx = similarity.argmax(dim=-1, keepdim=True)  # idx: torch.Size([8, 1])
+
+        # idx_expanded를 current_latents와 동일한 차원으로 확장
+        idx_expanded = idx.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # idx_expanded: torch.Size([8, 1, 1, 1])
+
+        # Latent adjustment (Modified blending)
+        # 1. idx_expanded의 차원을 맞추기 위해 current_latents의 나머지 차원에 맞게 확장
+        idx_expanded = idx_expanded.expand(-1, current_latents.size(1), current_latents.size(2), current_latents.size(3))  # torch.Size([8, 4, 64, 64])
+
+        # Normalize similarity for soft weighting
+        weights = similarity / similarity.sum(dim=-1, keepdim=True)  # Normalize weights
+        weights = weights.view(-1, 1, 1, 1)  # Reshape for broadcasting
+
+        # Compute soft blending
+        adjusted_latents = weights * previous_latents  # Soft-weighted adjustment
+        blend_strength = 0.99  # Control blending strength
+        current_latents = blend_strength * current_latents + (1 - blend_strength) * adjusted_latents
+
+        return current_latents
+
+    def compute_cosine_sim(self, current_latents, previous_latents):
+        current_latents_flat = current_latents.view(current_latents.size(0), -1)  # shape: [8, 4*64*64]
+        previous_latents_flat = previous_latents.view(previous_latents.size(0), -1)  # shape: [8, 4*64*64]
+        cosine_sim = F.cosine_similarity(current_latents_flat, previous_latents_flat, dim=-1) # torch.Size([8])
+        return cosine_sim
+    
+    @torch.no_grad()
+    def denoise_step_w_intermediate(self, x, t, indices, use_deflicker=True, interpolate_steps=5):
+        # register the time step and features in pnp injection modules
+        source_latents = load_source_latents_t(t, self.latents_path)[indices]
+        latent_model_input = torch.cat([source_latents] + ([x] * 2))
+        if self.sd_version == 'depth':
+            latent_model_input = torch.cat([latent_model_input, torch.cat([self.depth_maps[indices]] * 3)], dim=1)
+
+        register_time(self, t.item())
+
+        # compute text embeddings
+        text_embed_input = torch.cat([self.pnp_guidance_embeds.repeat(len(indices), 1, 1),
+                                      torch.repeat_interleave(self.text_embeds, len(indices), dim=0)])
+
+        # apply the denoising network
+        noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embed_input)['sample']
+
+        # perform guidance
+        _, noise_pred_uncond, noise_pred_cond = noise_pred.chunk(3)
+        noise_pred = noise_pred_uncond + self.config["guidance_scale"] * (noise_pred_cond - noise_pred_uncond)
+
+        # compute the denoising step with the reference model
+        denoised_latent = self.scheduler.step(noise_pred, t, x)['prev_sample']
+        
+        # Generate intermediate latents if applicable
+        if self.previous_latents is not None:
+            intermediates = []
+            for alpha in torch.linspace(0, 1, interpolate_steps):
+                intermediate = (1 - alpha) * self.previous_latents + alpha * denoised_latent
+                intermediates.append(intermediate)
+            
+            # Use the final intermediate as the updated latent
+            denoised_latent = intermediates[-1]
+        
+        # Update previous latents
+        self.previous_latents = denoised_latent.detach()
+
+        return denoised_latent
+
+    
     @torch.autocast(dtype=torch.float16, device_type='cuda')
     def batched_denoise_step(self, x, t, indices):
         batch_size = self.config["batch_size"]
         denoised_latents = []
-        pivotal_idx = torch.randint(batch_size, (len(x)//batch_size,)) + torch.arange(0,len(x),batch_size) 
+        pivotal_idx = torch.randint(batch_size, (len(x)//batch_size,)) + torch.arange(0,len(x),batch_size)
+        # two frames
+        # pivotal_idx = torch.randint(batch_size, (len(x) // batch_size, 2)) + torch.arange(0, len(x), batch_size).unsqueeze(1)
+        # pivotal_idx = pivotal_idx.flatten()  # 최종적으로 1D 형태로 변환
+        # all
+        # pivotal_idx = torch.arange(len(x))
+        # one frame
+        # pivotal_idx = torch.arange(0, len(x), batch_size) + batch_size // 2
             
         register_pivotal(self, True)
         self.denoise_step(x[pivotal_idx], t, indices[pivotal_idx])
         register_pivotal(self, False)
         for i, b in enumerate(range(0, len(x), batch_size)):
             register_batch_idx(self, i)
-            denoised_latents.append(self.denoise_step(x[b:b + batch_size], t, indices[b:b + batch_size]))
+            denoised_latents.append(self.denoise_step_w_intermediate(x[b:b + batch_size], t, indices[b:b + batch_size]))
         denoised_latents = torch.cat(denoised_latents)
         return denoised_latents
 
@@ -265,7 +384,7 @@ class TokenFlow(nn.Module):
         os.makedirs(f'{self.config["output_path"]}/img_ode', exist_ok=True)
         for i, t in enumerate(tqdm(self.scheduler.timesteps, desc="Sampling")):
                 x = self.batched_denoise_step(x, t, indices)
-        
+        # import ipdb; ipdb.set_trace()
         decoded_latents = self.decode_latents(x)
         for i in range(len(decoded_latents)):
             T.ToPILImage()(decoded_latents[i]).save(f'{self.config["output_path"]}/img_ode/%05d.png' % i)
